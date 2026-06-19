@@ -20,19 +20,29 @@ step (e.g. *"add my outro + logo to this clip"*).
 
 ## Install
 
-Install it as a Claude Code **plugin** — two slash commands, typed **inside
-Claude Code**. No terminal, nothing to move:
+The skill ships as a Claude Code **plugin**. Install it once with the
+`claude plugin` CLI — run these in **any terminal** (the standalone Claude Code
+CLI, or the built-in terminal in VS Code / the desktop app). It then shows up
+across all your Claude Code surfaces:
 
-```text
-/plugin marketplace add PurasAI/ugc-video-ads-workflow
-/plugin install ugc-video-ads@purasai
+```bash
+claude plugin marketplace add PurasAI/ugc-video-ads-workflow
+claude plugin install ugc-video-ads@purasai
 ```
 
-That's the whole install. The first time you ask for an ad, the skill
-**bootstraps its own dependencies** (a local Python venv + `ffmpeg`) — you never
-run `pip` or `brew` yourself. The only thing it can't do for you is log in to
-Puras (that funds the AI renders): if you're not logged in, Claude tells you to
-run `puras login` once.
+**Prefer clicking, or no terminal?**
+- **Terminal CLI:** you can also do it interactively with the `/plugin` slash command.
+- **Desktop app:** open the plugin manager from the app menu (**Plugins → Manage
+  plugins**), add the marketplace `PurasAI/ugc-video-ads-workflow`, then install
+  **ugc-video-ads**.
+- **VS Code / JetBrains extensions:** `/plugin` isn't a slash command there — use
+  the `claude plugin …` commands above in the integrated terminal (the plugin is
+  shared config, so it then appears in the extension too).
+
+Once installed, the first time you ask for an ad the skill **bootstraps its own
+dependencies** (a local Python venv + `ffmpeg`) — you never run `pip` or `brew`
+yourself. The one thing it can't do for you is log in to Puras (that funds the AI
+renders): if you're not logged in, Claude tells you to run `puras login` once.
 
 <details>
 <summary>Manual / developer install (no plugin manager)</summary>

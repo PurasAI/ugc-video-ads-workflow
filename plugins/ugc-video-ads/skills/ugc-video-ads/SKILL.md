@@ -143,7 +143,9 @@ images small; repeat the flag for array fields like `product_images`).
   `last_frame` (stitch seams), `aspect_ratios[]` (`9:16`/`1:1`/`16:9`),
   `duration_seconds` (4–15, def 8), `music` (**string** mood/genre, optional —
   omit to auto-pick), `captions` (**boolean**, def true — burns karaoke captions
-  in-skill). → `videos[].video_url`.
+  in-skill). → `videos[].video_url`. **Planning a screen replacement?** Ground the
+  phone screen with the bundled tracker image (`assets/tracker-green-3x3.png`) — see
+  the **screen-replace** module, Step 1.
 - `motion-ad-video` — storyboarded motion ad. `product-reveal-video` — cinematic
   reveal. `social-photo` / `static-image-ad` — product stills/image ads.
   `promo` — GSAP motion-graphics promo (`brief`, `product_name`, `accent_color`,
@@ -198,36 +200,49 @@ karaoke) via `generate`, or overlay a fixed `--label` for a simple on-screen lin
 ---
 
 ## Module: screen-replace — drop real UI into a green phone screen (free, OpenCV)
-When a clip shows a phone (or device) with a **green screen carrying tracking
-markers**, replace the screen with your own UI image/video — **marker-assisted
-planar tracking**: the markers are detected every frame (drift-free, sub-pixel),
-a homography warps the insert onto the screen, and the real green is keyed out *on
-top* so the bezel and any finger/hand in front stay untouched. Deterministic
-classic CV (no ML); built for a rock-solid, jitter-free track.
+A **two-step pipeline**: **(1)** generate (or shoot) a clip whose phone holds the bundled
+**green tracker screen**, then **(2)** replace that screen with your UI. The replace step
+is **marker-assisted planar tracking** — markers detected every frame (drift-free,
+sub-pixel), a homography warps the insert onto the screen, and the real green is keyed out
+*on top* so the bezel and any finger/hand in front stay untouched. Deterministic classic
+CV (no ML); rock-solid, jitter-free.
 
+### Step 1 — generate the clip with the bundled tracker screen
+The skill ships a ready tracker image tuned for this tool:
+**`${CLAUDE_SKILL_DIR}/assets/tracker-green-3x3.png`** — a vivid chroma-green screen with
+a **3×3 grid of black "+" markers** (auto-detected, reaches the corners, sub-pixel). When
+generating, hand it to `ugc-video` as the **phone-screen reference** and describe it in
+the brief, so the rendered phone holds exactly that screen:
 ```bash
-# still UI image into the screen:
-python3 tools/green_screen.py --video clip.mp4 --image app-ui.png --out out.mp4
-# or a looping video, plus a tracking-overlay diagnostic:
-python3 tools/green_screen.py --video clip.mp4 --screen app-demo.mp4 --out out.mp4 \
-    --debug debug.mp4
+python3 tools/puras_skill.py --brief projects/<slug>/briefs/<name>.md \
+    --image first_frame=${CLAUDE_SKILL_DIR}/assets/tracker-green-3x3.png \
+    --download-dir projects/<slug>/generated
+```
+In the brief body, say the creator **holds a phone whose screen is a solid green screen
+showing a 3×3 grid of black "+" crosshair tracking markers**, held flat and front-facing.
+(Pass the image to whichever `ugc-video` input grounds on-screen content — its
+screen-grounding/first-frame reference; confirm the field on the skill's page.)
+
+### Step 2 — replace the screen
+```bash
+# still UI image:
+python3 tools/green_screen.py --video generated/clip.mp4 --image app-ui.png --out out/final.mp4
+# or a looping video, + a tracking-overlay diagnostic:
+python3 tools/green_screen.py --video generated/clip.mp4 --screen app-demo.mp4 \
+    --out out/final.mp4 --debug debug.mp4
 ```
 
-### ⚠ Shooting requirements — the source clip MUST be made for this
-For the track to lock, the clip you generate/shoot **must** meet these (state them
-in the `ugc-video` brief, or when filming):
-- **Green screen + 6 markers.** The device screen is a **green screen** with **six
-  black "+" crosshair markers in a regular 2×3 grid** (top-L/R, mid-L/R, bottom-L/R).
-  The markers are what make the track stable — without them it can only fall back to
-  the wobblier green-outline.
-- **Keep the phone flat & front-facing.** As perpendicular to the camera as possible;
-  **avoid large tilt/rotation** and fast whip motion. Heavy perspective + motion blur
-  is the hard case.
-- **Keep the whole screen inside the frame.** The screen must **stay fully visible** —
-  don't let it clip at the frame edges or move partly in/out of frame; markers leaving
-  the frame break the lock.
-- **No other big green areas** in the shot (a green wall/object gets keyed too) — and
+### ⚠ For the track to lock — keep these in the brief / when shooting
+The bundled tracker image already satisfies "green + markers"; the rest is framing:
+- **Flat & front-facing.** Phone as perpendicular to the camera as possible; **avoid
+  large tilt/rotation** and fast whip motion (heavy perspective + motion blur is the hard
+  case).
+- **Whole screen in frame.** It must **stay fully visible** — don't let it clip at the
+  frame edges or move partly in/out; markers leaving the frame break the lock.
+- **No other big green areas** in the shot (a green wall/object gets keyed too), and
   nothing should fully cover the markers for long.
+- **Custom screen?** Any regular marker grid works — the tool auto-detects **2×3 / 3×2 /
+  2×2 …** and orientation; **6+ markers reaching the corners** track best.
 
 ### Low-confidence → black (graceful fallback)
 Wherever those conditions break (too tilted, blurred, markers occluded or off-screen),
@@ -238,10 +253,9 @@ showing a misaligned insert — crossfading in/out over a few frames so failures
 full-marker track, yellow = partial, orange = green-outline fallback, red = hold).
 
 **Tuning:** narrow `--hue` / `--sat-min` / `--val-min` if the key grabs scene green;
-`--rot-window`/`--scale-window` raise smoothing if a residual wobble remains;
-`--subpix saddle` (default) is best on motion blur. Refinements (shape-validation,
-saddle sub-pixel, One-Euro smoothing) are **on by default** — disable with
-`--no-shape-validate` / `--subpix cornersubpix` / `--no-oneeuro`.
+`--rot-window` / `--scale-window` raise smoothing if a residual wobble remains. Marker
+**shape-validation** (rejects non-cross blobs → kills false positives) is on by default;
+`--no-shape-validate` disables it.
 
 ---
 

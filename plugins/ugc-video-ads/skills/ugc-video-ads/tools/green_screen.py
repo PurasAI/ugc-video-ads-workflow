@@ -21,7 +21,7 @@ Pipeline
    a partial set is FUSED with the green quad (quad pins the extent, markers refine the
    interior -> no extrapolation shear). Fall back to the green quad when <4 markers match.
 4. Stabilise: decompose the 4 corners into position / rotation / uniform-scale (Procrustes)
-   + perspective residual and zero-phase smooth each channel; optional One-Euro pre-filter.
+   + perspective residual and zero-phase smooth each channel (scale & rotation hardest).
 5. Composite: warp the replacement onto the screen (Lanczos) and key the REAL green out on
    top (tracking-independent matte) so the bezel and fingers occlude the insert. Where the
    marker track is low-confidence, the screen is keyed to BLACK (no risk of a misaligned
@@ -88,37 +88,23 @@ def fill_small_holes(mask, max_area):
     return out
 
 
-def screen_matte(bgr, hue, smin, vmin):
-    """Tracking-INDEPENDENT screen alpha: the largest green blob (the device screen),
-    with marker holes filled and finger occlusions preserved. Returns a uint8 mask."""
-    gm = key_green_mask(bgr, hue, smin, vmin)
-    gm = cv2.morphologyEx(gm, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    n, lab, stats, _ = cv2.connectedComponentsWithStats(gm, 8)
-    H, W = bgr.shape[:2]
-    if n <= 1:
-        return np.zeros((H, W), np.uint8)
-    idx = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    if stats[idx, cv2.CC_STAT_AREA] < 0.0015 * W * H:
-        return np.zeros((H, W), np.uint8)
-    screen = (lab == idx).astype(np.uint8) * 255
-    area = float(stats[idx, cv2.CC_STAT_AREA])
-    screen = cv2.morphologyEx(screen, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
-    return fill_small_holes(screen, max_area=max(1500.0, 0.03 * area))
-
-
 def greenness(bgr):
     b, g, r = cv2.split(bgr.astype(np.int16))
     return (g - np.maximum(r, b)).astype(np.float32)   # large+ on pure green
 
 
-def screen_matte_global(bgr, cb, cw):
-    """Continuous chroma matte with GLOBALLY-FIXED clip levels (computed once over the
-    whole clip) -> identical mapping every frame. Experimental (off by default)."""
-    d = greenness(bgr)
-    soft = np.clip((d - cb) / max(1.0, (cw - cb)), 0.0, 1.0)
-    binary = cv2.morphologyEx((d > cb).astype(np.uint8) * 255, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    n, lab, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+def screen_matte(bgr, hue, smin, vmin):
+    """COLOR-DIFFERENCE key (the core of Keylight): the key signal is
+    d = G - max(R, B) — large on green, ~0 on the neutral/dark bezel — and the alpha is a
+    clipped linear ramp of d. Because d ~ 0 on the bezel, the soft edge sits EXACTLY on the
+    green->bezel transition (no creep into the black frame, no ragged binary stair-step).
+    Returns a continuous [0,1] matte. Interior dark marks (the "+" markers, the notch) are
+    filled to solid; large foreground occluders (fingers) stay transparent for occlusion.
+    A garbage matte (the largest green blob) ignores stray scene green."""
+    b, g, r = cv2.split(bgr.astype(np.float32))
+    d = g - np.maximum(r, b)
     H, W = bgr.shape[:2]
+    n, lab, stats, _ = cv2.connectedComponentsWithStats((d > 20).astype(np.uint8), 8)
     if n <= 1:
         return np.zeros((H, W), np.float32)
     idx = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
@@ -126,11 +112,18 @@ def screen_matte_global(bgr, cb, cw):
         return np.zeros((H, W), np.float32)
     screen = (lab == idx).astype(np.uint8) * 255
     area = float(stats[idx, cv2.CC_STAT_AREA])
-    screen = cv2.morphologyEx(screen, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
-    screen = fill_small_holes(screen, max_area=max(1500.0, 0.03 * area))
-    a = soft * (screen.astype(np.float32) / 255.0)
-    a[(screen > 0) & (soft < 1.0)] = 1.0
-    return a
+    inner = cv2.erode(screen, np.ones((11, 11), np.uint8)) > 0
+    hi = float(np.percentile(d[inner], 50)) if int(np.count_nonzero(inner)) > 50 else float(d.max())
+    cb, cw = 0.10 * hi, 0.55 * hi               # clip-black / clip-white
+    alpha = np.clip((d - cb) / max(1.0, cw - cb), 0.0, 1.0)
+    alpha[~(cv2.dilate(screen, np.ones((7, 7), np.uint8)) > 0)] = 0.0     # garbage matte
+    # fill interior dark marks (markers + notch) incl. their anti-aliased halo: small enclosed
+    # holes in the solid-green core -> set to 1. Large holes (fingers) stay open -> occlusion.
+    solid = (alpha > 0.85).astype(np.uint8) * 255
+    filled = fill_small_holes(solid, max_area=max(3000.0, 0.06 * area))
+    fillmask = cv2.dilate(((filled > 0) & (solid == 0)).astype(np.uint8), np.ones((3, 3), np.uint8))
+    alpha[fillmask > 0] = 1.0
+    return np.clip(cv2.GaussianBlur(alpha, (0, 0), 0.6), 0.0, 1.0)
 
 
 def order_quad(pts):
@@ -157,57 +150,44 @@ def screen_quad_and_filled(mask):
     return order_quad(quad), filled
 
 
-def saddle_refine(gray, seeds, win=4):
-    """Sub-pixel via analytic saddle fit: a "+" centre is an intensity saddle. Fit
-    z = ax^2+bxy+cy^2+dx+ey+f on a window and solve for the critical point — more
-    robust to motion blur than cornerSubPix."""
-    g = gray.astype(np.float64); H, W = gray.shape
-    xs, ys = np.meshgrid(np.arange(-win, win + 1), np.arange(-win, win + 1))
-    xr, yr = xs.ravel().astype(float), ys.ravel().astype(float)
-    Ap = np.linalg.pinv(np.column_stack([xr * xr, xr * yr, yr * yr, xr, yr, np.ones_like(xr)]))
-    out = seeds.copy()
-    for k, (x, y) in enumerate(seeds):
-        xi, yi = int(round(x)), int(round(y))
-        if xi - win < 0 or yi - win < 0 or xi + win >= W or yi + win >= H:
-            continue
-        a, b, c, d, e, _ = Ap @ g[yi - win:yi + win + 1, xi - win:xi + win + 1].ravel()
-        try:
-            dxy = np.linalg.solve(np.array([[2 * a, b], [b, 2 * c]]), [-d, -e])
-        except np.linalg.LinAlgError:
-            continue
-        if abs(dxy[0]) <= win and abs(dxy[1]) <= win:
-            out[k] = [xi + dxy[0], yi + dxy[1]]
-    return out.astype(np.float32)
-
-
-def detect_markers(gray, filled, shape_validate=True, subpix="saddle"):
-    inner = cv2.erode(filled, np.ones((15, 15), np.uint8)) > 0
-    if inner.sum() < 200:
+def detect_markers(gray, filled, shape_validate=True, subpix="cornersubpix"):
+    ys, xs = np.where(filled > 0)
+    if len(xs) < 50:
         return np.zeros((0, 2), np.float32)
-    thr = float(np.clip(np.median(gray[inner]) * 0.62, 55, 135))   # markers far darker than green
-    dark = (inner & (gray < thr)).astype(np.uint8) * 255
+    sw, sh = xs.max() - xs.min(), ys.max() - ys.min()
+    inner = cv2.erode(filled, np.ones((15, 15), np.uint8)) > 0
+    if int(np.count_nonzero(inner)) < 200:
+        return np.zeros((0, 2), np.float32)
+    # contrast-INVARIANT dark-spot detection: black-hat finds dark marks smaller than the
+    # kernel regardless of absolute darkness — generated markers are often low-contrast grey,
+    # which an absolute threshold misses (markers detected late / not at all).
+    k = int(np.clip(round(0.13 * min(sw, sh)), 9, 61)); k += 1 - k % 2
+    bh = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    vals = bh[inner]
+    if vals.max() < 10:
+        return np.zeros((0, 2), np.float32)
+    t = max(10.0, 0.35 * float(vals.max()))
+    dark = ((bh >= t) & inner).astype(np.uint8) * 255
     dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
     n, lab, stats, cent = cv2.connectedComponentsWithStats(dark, 8)
-    area = inner.sum(); pts = []
+    area = int(np.count_nonzero(inner)); pts = []
     for i in range(1, n):
         a = stats[i, cv2.CC_STAT_AREA]; w = stats[i, cv2.CC_STAT_WIDTH]; h = stats[i, cv2.CC_STAT_HEIGHT]
-        if a < 8 or a > area * 0.01:
+        if a < 6 or a > area * 0.02:
             continue
-        if max(w, h) > 0.15 * gray.shape[0]:
+        if max(w, h) > 0.2 * gray.shape[0]:
             continue
         if shape_validate:
             # a "+" is sparse in its bbox; reject solid blobs (fingertips/notch -> high
             # extent) and streaks (extreme aspect). Rotation-invariant.
             extent = a / float(max(1, w * h)); ar = w / float(max(1, h))
-            if extent > 0.62 or extent < 0.10 or ar < 0.35 or ar > 2.9:
+            if extent > 0.85 or extent < 0.06 or ar < 0.30 or ar > 3.3:
                 continue
         pts.append([float(cent[i][0]), float(cent[i][1])])
     if not pts:
         return np.zeros((0, 2), np.float32)
     pts = np.array(pts, np.float32)
-    if subpix == "saddle":
-        pts = saddle_refine(gray, pts)
-    elif subpix == "cornersubpix":
+    if subpix == "cornersubpix":
         p = pts.reshape(-1, 1, 2).copy()
         cv2.cornerSubPix(gray, p, (5, 5), (-1, -1),
                          (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
@@ -215,22 +195,28 @@ def detect_markers(gray, filled, shape_validate=True, subpix="saddle"):
     return pts.reshape(-1, 2)
 
 
-# ============================ lattice model ============================
-G_IDEAL = np.array([[0, 0], [1, 0], [0, 1], [1, 1], [0, 2], [1, 2]], np.float32)  # (col,row)
-PRIOR_RECT_G = np.array([[-0.125, -0.25], [1.125, -0.25],
-                         [1.125, 2.25], [-0.125, 2.25]], np.float32)
+# ============================ marker grid ============================
+# The markers form a regular nx-by-ny grid (e.g. 2x3 portrait, 3x2 landscape, 2x2).
+# Nothing is hardcoded — the grid dims AND the canonical marker positions (in the
+# screen's unit square) are auto-detected per clip in main(), so any orientation /
+# inset / marker count works. The screen rectangle IS the unit square [0,1]x[0,1].
+UNIT = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], np.float32)   # screen corners TL,TR,BR,BL
 
 
-def match_lattice(det, predH, diag, thr_frac=0.12):
-    """Greedy match the 6 lattice nodes (projected by predH) to detections."""
-    proj = cv2.perspectiveTransform(G_IDEAL.reshape(-1, 1, 2), predH).reshape(-1, 2)
+def match_lattice(det, predH, diag, canon, thr_frac=0.12):
+    """Greedy-match canonical markers (projected by predH) to detections.
+    Returns (indices into canon, matched canon pts, matched detection pts)."""
+    proj = cv2.perspectiveTransform(canon.reshape(-1, 1, 2), predH).reshape(-1, 2)
     thr = thr_frac * diag
-    src, dst, used = [], [], set()
+    idxs, dst, used = [], [], set()
     for gi in np.argsort([np.min(np.linalg.norm(det - p, axis=1)) for p in proj]):
         dd = np.linalg.norm(det - proj[gi], axis=1); j = int(np.argmin(dd))
         if dd[j] < thr and j not in used:
-            used.add(j); src.append(G_IDEAL[gi]); dst.append(det[j])
-    return np.array(src, np.float32), np.array(dst, np.float32)
+            used.add(j); idxs.append(int(gi)); dst.append(det[j])
+    idxs = np.array(idxs, int)
+    return (idxs,
+            canon[idxs] if len(idxs) else np.zeros((0, 2), np.float32),
+            np.array(dst, np.float32) if dst else np.zeros((0, 2), np.float32))
 
 
 # ============================ stabilisation ============================
@@ -254,31 +240,6 @@ def _smooth(arr, good, window):
         for c in range(D):
             sm[:, c] = np.convolve(np.pad(out[:, c], r, mode="edge"), k, "valid")
         return sm
-
-
-def _oneeuro_causal(x, mincut, beta, fs):
-    out = np.empty_like(x); out[0] = x[0]; xp = x[0]; dxf = 0.0
-    a_d = 1.0 / (1.0 + (fs / (2 * np.pi * 1.0)))
-    for i in range(1, len(x)):
-        dxf = a_d * ((x[i] - xp) * fs) + (1 - a_d) * dxf
-        a = 1.0 / (1.0 + (fs / (2 * np.pi * (mincut + beta * abs(dxf)))))
-        xf = a * x[i] + (1 - a) * xp
-        out[i] = xf; xp = xf
-    return out
-
-
-def oneeuro_fb(arr, good, fs, mincut=1.2, beta=0.4):
-    """Zero-phase One-Euro (forward+backward): speed-adaptive -> heavy smoothing at rest
-    (kills shimmer), low lag during motion. Gaps interpolated over `good`."""
-    N, D = arr.shape; out = arr.astype(np.float64).copy(); idx = np.arange(N); g = good.astype(bool)
-    if g.sum() >= 2:
-        for c in range(D):
-            out[~g, c] = np.interp(idx[~g], idx[g], out[g, c])
-    for c in range(D):
-        f = _oneeuro_causal(out[:, c], mincut, beta, fs)
-        b = _oneeuro_causal(out[::-1, c], mincut, beta, fs)[::-1]
-        out[:, c] = 0.5 * (f + b)
-    return out
 
 
 def stabilise(corners, good, aspect, pos_w, rot_w, scale_w, persp_w):
@@ -343,7 +304,8 @@ def main():
     ap.add_argument("--persp-window", type=int, default=7, help="smoothing window: perspective residual")
     ap.add_argument("--overfill", type=float, default=1.04, help="warp the insert onto a quad this much "
                     "bigger so it always covers the green; the key clips it back")
-    ap.add_argument("--feather", type=float, default=1.2, help="key edge feather sigma (px)")
+    ap.add_argument("--feather", type=float, default=0.6, help="extra key-edge feather sigma "
+                    "(px; the matte is already anti-aliased — raise only if you want softer)")
     ap.add_argument("--despill-bias", type=float, default=0.5)
     ap.add_argument("--low-conf", choices=["black", "ui"], default="black",
                     help="where the marker track is low-confidence: 'black' keys the green to black "
@@ -352,14 +314,10 @@ def main():
                     help="frames to crossfade insert<->black at confidence boundaries")
     ap.add_argument("--no-shape-validate", dest="shape_validate", action="store_false",
                     help="keep all dark blobs as markers (don't reject by cross shape)")
-    ap.add_argument("--subpix", choices=["saddle", "cornersubpix", "none"], default="saddle",
-                    help="marker sub-pixel method (default saddle: best on motion blur)")
-    ap.add_argument("--no-oneeuro", dest="oneeuro", action="store_false",
-                    help="disable the One-Euro speed-adaptive pre-filter")
-    ap.add_argument("--global-key", action="store_true",
-                    help="experimental globally-fixed continuous chroma matte (off by default)")
+    ap.add_argument("--subpix", choices=["cornersubpix", "none"], default="cornersubpix",
+                    help="marker sub-pixel refinement method")
     ap.add_argument("--debug", help="optional overlay diagnostic clip (tracked quad + markers)")
-    ap.set_defaults(shape_validate=True, oneeuro=True)
+    ap.set_defaults(shape_validate=True)
     args = ap.parse_args()
 
     C.need_ffmpeg()
@@ -382,7 +340,6 @@ def main():
 
     # ---- PASS 1: detect green + markers per frame ----
     grays, quads, marks, ok_s = [], [], [], []
-    green_d = []
     while True:
         ok, fr = cap.read()
         if not ok:
@@ -395,55 +352,120 @@ def main():
         quads.append(q); ok_s.append(q is not None)
         marks.append(detect_markers(g, filled, args.shape_validate, args.subpix)
                      if filled is not None else np.zeros((0, 2), np.float32))
-        if args.global_key and filled is not None:
-            green_d.append(np.percentile(greenness(fr)[filled > 0], [8, 60]))
     cap.release(); N = len(grays)
     if N == 0:
         C.die("no frames read from --video")
     if not any(ok_s):
         C.die("no green screen detected — widen --hue/--sat-min/--val-min, use --debug")
-    gk_cb = gk_cw = None
-    if args.global_key and green_d:
-        gd = np.array(green_d); gk_cb = float(np.median(gd[:, 0])); gk_cw = float(np.median(gd[:, 1]))
-        if gk_cw - gk_cb < 8:
-            gk_cw = gk_cb + 8
 
-    # ---- calibrate the screen rectangle in lattice space ----
+    # ---- auto-detect the marker grid (nx x ny), any orientation / inset / count ----
+    cand = [i for i in range(N) if ok_s[i] and quads[i] is not None and len(marks[i]) >= 4]
+    if not cand:
+        C.die("no tracking markers found in the green screen (need black '+' marks); "
+              "this tool tracks a marker-grid screen — check --hue or add markers.")
+
+    def perspectiveness(q):
+        # 0 = a perfect rectangle (frontal); higher = more perspective distortion.
+        d1 = np.linalg.norm(q[0] - q[2]); d2 = np.linalg.norm(q[1] - q[3])
+        top = np.linalg.norm(q[1] - q[0]); bot = np.linalg.norm(q[2] - q[3])
+        lft = np.linalg.norm(q[3] - q[0]); rgt = np.linalg.norm(q[2] - q[1])
+        return (abs(d1 - d2) / (d1 + d2 + 1e-6) + abs(top - bot) / (top + bot + 1e-6)
+                + abs(lft - rgt) / (lft + rgt + 1e-6))
+
+    # Screen orientation (median over green frames) + the full marker count M, taken as the
+    # most common count with real support so false-positive frames (extra blobs) don't win.
+    asp = []
+    for i in cand:
+        q = quads[i]
+        w = (np.linalg.norm(q[1] - q[0]) + np.linalg.norm(q[2] - q[3])) / 2
+        h = (np.linalg.norm(q[3] - q[0]) + np.linalg.norm(q[2] - q[1])) / 2
+        if h > 1:
+            asp.append(w / h)
+    landscape = bool(asp) and float(np.median(asp)) > 1.0
+    from collections import Counter
+    cnt = Counter(len(marks[i]) for i in cand)
+    # full grid size = the MOST COMMON marker count (mode), robust to occasional
+    # false-positive frames with extra blobs. ties -> larger count.
+    counts = [(v, k) for k, v in cnt.items() if 4 <= k <= 12]
+    M = max(counts)[1] if counts else max(len(marks[i]) for i in cand)
+    # grid dims from M + orientation (markers run 2 along the short side, 3 along the long)
+    DIMS = {4: (2, 2), 6: (3, 2) if landscape else (2, 3), 8: (4, 2) if landscape else (2, 4),
+            9: (3, 3)}
+    nx, ny = DIMS.get(M, (3, 2) if landscape else (2, 3))
+    G_IDEAL = np.array([[c, r] for r in range(ny) for c in range(nx)], np.float32)
+
+    # Calibration prior bootstraps the lattice->image match. Two sources, and we keep
+    # whichever calibrates the MOST frames: (a) a generic inset (works when markers sit
+    # near the screen edges — c1g/c3g/g2), (b) priors derived from frontal full-grid
+    # frames by SORTING markers into the grid (needed when markers are inset oddly, e.g.
+    # g1's central cluster). Trying several frames + validating beats trusting one.
+    sx = 0.76 / max(1, nx - 1) if nx > 1 else 1.0
+    sy = 0.76 / max(1, ny - 1) if ny > 1 else 1.0
+    generic = np.array([[-0.12 / sx, -0.12 / sy], [(nx - 1) + 0.12 / sx, -0.12 / sy],
+                        [(nx - 1) + 0.12 / sx, (ny - 1) + 0.12 / sy], [-0.12 / sx, (ny - 1) + 0.12 / sy]], np.float32)
+
+    def prior_from_ref(i):
+        qr = quads[i]; mr = marks[i]
+        e = qr[1] - qr[0]; ang = np.arctan2(e[1], e[0]); co, si = np.cos(-ang), np.sin(-ang)
+        mrr = (mr - mr.mean(0)) @ np.array([[co, -si], [si, co]]).T   # de-rotate to screen axes
+        order = np.argsort(mrr[:, 1]); lab = np.zeros((len(mr), 2), np.float32)
+        for r in range(ny):
+            ri = order[r * nx:(r + 1) * nx]
+            for c, idx in enumerate(ri[np.argsort(mrr[ri, 0])]):
+                lab[idx] = [c, r]
+        Hl, _ = cv2.findHomography(lab, mr, 0)
+        if Hl is None or not np.all(np.isfinite(Hl)):
+            return None
+        pr = cv2.perspectiveTransform(qr.reshape(-1, 1, 2), np.linalg.inv(Hl)).reshape(-1, 2)
+        if not np.all(np.isfinite(pr)) or np.any(np.abs(pr) > nx + ny + 6):
+            return None
+        pr = order_quad(pr)
+        return pr if cv2.contourArea(pr) > 0.2 else None
+
     def collect(prior):
         out = []
-        for i in range(N):
-            if not ok_s[i] or quads[i] is None or len(marks[i]) < 4:
-                continue
+        for i in cand:
             Hq, _ = cv2.findHomography(prior, quads[i], 0)
             if Hq is None:
                 continue
             diag = np.linalg.norm(quads[i][0] - quads[i][2])
-            src, dst = match_lattice(marks[i], Hq, diag)
+            _, src, dst = match_lattice(marks[i], Hq, diag, G_IDEAL)
             if len(src) < 4:
                 continue
             Hg, _ = cv2.findHomography(src, dst, cv2.RANSAC, 2.0)
             if Hg is None:
                 continue
             rg = cv2.perspectiveTransform(quads[i].reshape(-1, 1, 2), np.linalg.inv(Hg)).reshape(-1, 2)
-            if not np.any(np.abs(rg) > 6):
+            if not np.any(np.abs(rg) > max(nx, ny) + 4):
                 out.append(rg)
         return out
 
-    rects = collect(PRIOR_RECT_G)
+    full = [i for i in cand if len(marks[i]) == nx * ny]
+    candidates = [generic]
+    for i in sorted(full, key=lambda i: perspectiveness(quads[i]))[:6]:
+        p = prior_from_ref(i)
+        if p is not None:
+            candidates.append(p)
+    rects = []
+    for p in candidates:
+        r = collect(p)
+        if len(r) > len(rects):
+            rects = r
     if not rects:
-        C.die("no tracking markers found in the green screen (need black '+' marks); "
-              "this tool tracks a marked screen. Add markers or check --hue.")
+        C.die(f"detected a {nx}x{ny} marker grid but could not calibrate it — check --debug.")
     rect_g = np.median(np.array(rects), axis=0).astype(np.float32)
     r2 = collect(rect_g)
     if len(r2) >= len(rects):
         rect_g = np.median(np.array(r2), axis=0).astype(np.float32)
-    # markers are drawn parallel to the screen edges -> the rectangle is axis-aligned in
-    # lattice space; drop the green-quad skew (notch/rounded corners) that would inject tilt.
+    # markers are parallel to the screen edges -> axis-align the rect (drop quad skew that
+    # would inject a constant tilt).
     xL = float((rect_g[0, 0] + rect_g[3, 0]) / 2); xR = float((rect_g[1, 0] + rect_g[2, 0]) / 2)
     yT = float((rect_g[0, 1] + rect_g[1, 1]) / 2); yB = float((rect_g[2, 1] + rect_g[3, 1]) / 2)
     rect_g = np.array([[xL, yT], [xR, yT], [xR, yB], [xL, yB]], np.float32)
 
     # ---- PASS 2: per-frame homography (markers fused with the green quad) ----
+    # markers map the lattice -> image; the quad pins the extent when the matched markers
+    # don't span the whole grid (avoids extrapolation shear).
     MK_W = 3
     corners = np.zeros((N, 4, 2), np.float32)
     good = np.zeros(N, bool); source = ["none"] * N
@@ -453,19 +475,18 @@ def main():
         if ok_s[i] and quads[i] is not None:
             Hq, _ = cv2.findHomography(rect_g, quads[i], 0)
         diag = np.linalg.norm(quads[i][0] - quads[i][2]) if (quads[i] is not None) else 200.0
-        msrc = mdst = None
+        msrc = mdst = None; full_span = False
         if ok_s[i] and len(marks[i]) >= 4:
             predH = Hq if Hq is not None else prevH
             if predH is not None:
-                s0, d0 = match_lattice(marks[i], predH, diag, thr_frac=0.10)
+                idxs, s0, d0 = match_lattice(marks[i], predH, diag, G_IDEAL, thr_frac=0.10)
                 if len(s0) >= 4:
                     _, mask = cv2.findHomography(s0, d0, cv2.RANSAC, 0.03 * diag)
                     if mask is not None and mask.ravel().sum() >= 4:
-                        keep = mask.ravel().astype(bool); msrc, mdst = s0[keep], d0[keep]
-        full_span = False
-        if msrc is not None:
-            rows = {int(round(v)) for v in msrc[:, 1]}; cols = {int(round(v)) for v in msrc[:, 0]}
-            full_span = (0 in rows and 2 in rows and 0 in cols and 1 in cols)
+                        keep = mask.ravel().astype(bool)
+                        msrc, mdst = s0[keep], d0[keep]
+                        cset = {int(round(c)) for c in msrc[:, 0]}; rset = {int(round(r)) for r in msrc[:, 1]}
+                        full_span = (0 in cset and nx - 1 in cset and 0 in rset and ny - 1 in rset)
         Hcur = None
         if msrc is not None and full_span:
             Hf, _ = cv2.findHomography(msrc, mdst, 0)
@@ -510,10 +531,7 @@ def main():
     aspect = float(np.median([quad_aspect(corners[i]) for i in gidx])) if gidx else 0.46
 
     # ---- stabilise ----
-    corners_in = corners
-    if args.oneeuro:
-        corners_in = oneeuro_fb(corners.reshape(N, 8), good, fps).reshape(N, 4, 2).astype(np.float32)
-    corners_s = stabilise(corners_in, good, aspect,
+    corners_s = stabilise(corners, good, aspect,
                           args.pos_window, args.rot_window, args.scale_window, args.persp_window)
 
     # ---- low-confidence -> black (time-eased confidence weight) ----
@@ -567,13 +585,11 @@ def main():
         Hc = cv2.getPerspectiveTransform(card_src, expand(S, args.overfill))
         card = cv2.warpPerspective(cards[fi % len(cards)], Hc, (W, H),
                                    flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE)
-        if args.global_key and gk_cb is not None:
-            a2 = screen_matte_global(frame, gk_cb, gk_cw)
-            gm = (a2 > 0.5).astype(np.uint8) * 255
-            alpha = np.clip(cv2.GaussianBlur(a2, (0, 0), args.feather), 0, 1)[:, :, None]
-        else:
-            gm = screen_matte(frame, hue, args.sat_min, args.val_min)
-            alpha = np.clip(cv2.GaussianBlur(gm.astype(np.float32) / 255.0, (0, 0), args.feather), 0, 1)[:, :, None]
+        a = screen_matte(frame, hue, args.sat_min, args.val_min)   # continuous, anti-aliased
+        if args.feather > 0:
+            a = np.clip(cv2.GaussianBlur(a, (0, 0), args.feather), 0, 1)
+        gm = (a > 0.5).astype(np.uint8) * 255                       # binary, for despill region
+        alpha = a[:, :, None]
         region = cv2.dilate(gm, np.ones((5, 5), np.uint8))
         plate = despill(frame, region, args.despill_bias)
         content = card.astype(np.float32) * float(w[fi])     # fade to black where low-confidence

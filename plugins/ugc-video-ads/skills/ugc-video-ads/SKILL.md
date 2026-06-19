@@ -197,24 +197,51 @@ karaoke) via `generate`, or overlay a fixed `--label` for a simple on-screen lin
 
 ---
 
-## Module: screen-replace — drop real UI into a green screen (free, OpenCV)
-When a clip shows a phone/laptop/TV with a **green screen**, replace it with your
-own video/image — tracked per frame and warped in with a homography, so it
-follows a handheld device and anything in front of the screen (a finger, a hand)
-stays untouched. Complements `ugc-video`'s built-in screen grounding for clips
-shot/generated with a green marker.
+## Module: screen-replace — drop real UI into a green phone screen (free, OpenCV)
+When a clip shows a phone (or device) with a **green screen carrying tracking
+markers**, replace the screen with your own UI image/video — **marker-assisted
+planar tracking**: the markers are detected every frame (drift-free, sub-pixel),
+a homography warps the insert onto the screen, and the real green is keyed out *on
+top* so the bezel and any finger/hand in front stay untouched. Deterministic
+classic CV (no ML); built for a rock-solid, jitter-free track.
 
 ```bash
-python3 tools/green_screen.py --video clip.mp4 --screen app-demo.mp4 --out out.mp4
-# shaky detection? tune the key and inspect what it found:
-python3 tools/green_screen.py --video clip.mp4 --screen app.png --out out.mp4 \
-    --hue 35,90 --sat-min 70 --val-min 70 --smooth 0.6 --debug debug.mp4
+# still UI image into the screen:
+python3 tools/green_screen.py --video clip.mp4 --image app-ui.png --out out.mp4
+# or a looping video, plus a tracking-overlay diagnostic:
+python3 tools/green_screen.py --video clip.mp4 --screen app-demo.mp4 --out out.mp4 \
+    --debug debug.mp4
 ```
-`--screen` is an image (static UI) or a video (looped). Corners are EMA-smoothed
-(`--smooth`) to kill jitter. **Gotcha:** the source must have no other large
-green areas or detection grabs them too — narrow `--hue`/`--sat-min`/`--val-min`
-and use `--debug` (writes a clip with the mask in red + the tracked quad in
-yellow) to dial it in.
+
+### ⚠ Shooting requirements — the source clip MUST be made for this
+For the track to lock, the clip you generate/shoot **must** meet these (state them
+in the `ugc-video` brief, or when filming):
+- **Green screen + 6 markers.** The device screen is a **green screen** with **six
+  black "+" crosshair markers in a regular 2×3 grid** (top-L/R, mid-L/R, bottom-L/R).
+  The markers are what make the track stable — without them it can only fall back to
+  the wobblier green-outline.
+- **Keep the phone flat & front-facing.** As perpendicular to the camera as possible;
+  **avoid large tilt/rotation** and fast whip motion. Heavy perspective + motion blur
+  is the hard case.
+- **Keep the whole screen inside the frame.** The screen must **stay fully visible** —
+  don't let it clip at the frame edges or move partly in/out of frame; markers leaving
+  the frame break the lock.
+- **No other big green areas** in the shot (a green wall/object gets keyed too) — and
+  nothing should fully cover the markers for long.
+
+### Low-confidence → black (graceful fallback)
+Wherever those conditions break (too tilted, blurred, markers occluded or off-screen),
+tracking confidence drops and the tool **keys the screen to solid black** instead of
+showing a misaligned insert — crossfading in/out over a few frames so failures look
+**intentional, never broken**. `--low-conf ui` forces the insert everywhere instead
+(useful to inspect the raw track); `--debug` writes an overlay clip (green quad =
+full-marker track, yellow = partial, orange = green-outline fallback, red = hold).
+
+**Tuning:** narrow `--hue` / `--sat-min` / `--val-min` if the key grabs scene green;
+`--rot-window`/`--scale-window` raise smoothing if a residual wobble remains;
+`--subpix saddle` (default) is best on motion blur. Refinements (shape-validation,
+saddle sub-pixel, One-Euro smoothing) are **on by default** — disable with
+`--no-shape-validate` / `--subpix cornersubpix` / `--no-oneeuro`.
 
 ---
 

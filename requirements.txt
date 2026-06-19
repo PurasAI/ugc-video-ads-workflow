@@ -1,0 +1,8 @@
+puras>=0.20
+Pillow>=9
+httpx>=0.27
+PyYAML>=6  # puras_skill.py: parse --brief markdown frontmatter
+opencv-python>=4.6  # green_screen.py: chroma-key + homography screen replacement
+numpy>=1.23
+scipy>=1.9  # green_screen.py: zero-phase (Savitzky-Golay) track smoothing (has a numpy fallback)
+# system dependency: ffmpeg + ffprobe on PATH (brew install ffmpeg)

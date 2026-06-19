@@ -243,6 +243,9 @@ def main():
     ap.add_argument("--download-dir", help="where to save downloaded media")
     ap.add_argument("--no-download", action="store_true")
     ap.add_argument("--version", type=int, help="pin to a deployment version")
+    ap.add_argument("--resume", metavar="JOB_ID",
+                    help="skip submit; re-attach to an existing job id, then poll "
+                         "and download (use to recover after a client-side timeout)")
     ap.add_argument("--timeout", type=int, default=900, help="max seconds to wait")
     ap.add_argument("--poll", type=float, default=3.0, help="poll interval seconds")
     ap.add_argument("--prefix", default="", help="filename prefix for downloads")
@@ -254,20 +257,29 @@ def main():
     except ImportError:
         die("`puras` package not importable — pip install puras")
 
-    inputs, brief_skill = build_inputs(args)
-    skill = args.skill or brief_skill
-    if not skill:
-        die("no skill given — pass it positionally or set `skill:` in the "
-            "--brief frontmatter")
     client = puras.Client(api_key=api_key, api_base=api_base)
 
-    log(f"→ submitting {skill}  (inputs: {', '.join(sorted(inputs)) or 'none'})")
-    try:
-        job = client.submit(skill, inputs, version=args.version)
-    except Exception as e:  # noqa: BLE001 — surface any submit failure cleanly
-        die(f"submit failed: {e}")
+    if args.resume:
+        skill = args.skill or "(resumed)"
+        jid = args.resume
+        log(f"→ resuming job {jid} (no resubmit)")
+        try:
+            job = client.get(jid)
+        except Exception as e:  # noqa: BLE001
+            die(f"could not fetch job {jid}: {e}")
+    else:
+        inputs, brief_skill = build_inputs(args)
+        skill = args.skill or brief_skill
+        if not skill:
+            die("no skill given — pass it positionally or set `skill:` in the "
+                "--brief frontmatter")
+        log(f"→ submitting {skill}  (inputs: {', '.join(sorted(inputs)) or 'none'})")
+        try:
+            job = client.submit(skill, inputs, version=args.version)
+        except Exception as e:  # noqa: BLE001 — surface any submit failure cleanly
+            die(f"submit failed: {e}")
+        jid = job["id"]
 
-    jid = job["id"]
     log(f"  job {jid} · {job.get('status')}")
     start = time.monotonic()
     last = job.get("status")

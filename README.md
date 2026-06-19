@@ -18,35 +18,36 @@ step (e.g. *"add my outro + logo to this clip"*).
 | **screen-replace** | Replace a green phone/laptop screen with real UI (chroma-key + homography) | free |
 | **variants** | A/B spin-offs (aspect ratios, hooks) | free |
 
-## Install into Claude Code
+## Install
 
-This is a skill — you install it into Claude Code once, then just talk to Claude.
+Install it as a Claude Code **plugin** — two slash commands, typed **inside
+Claude Code**. No terminal, nothing to move:
 
-**1. Clone the repo into your Claude Code skills folder**
-```bash
-# personal skill — available in every project
-git clone https://github.com/PurasAI/ugc-video-ads-workflow.git \
-  ~/.claude/skills/ugc-video-ads
-
-# …or as a project-scoped skill — only inside one repo
-git clone https://github.com/PurasAI/ugc-video-ads-workflow.git \
-  .claude/skills/ugc-video-ads
+```text
+/plugin marketplace add PurasAI/ugc-video-ads-workflow
+/plugin install ugc-video-ads@purasai
 ```
 
-**2. Install the tool dependencies** — the skill shells out to Python + ffmpeg
+That's the whole install. The first time you ask for an ad, the skill
+**bootstraps its own dependencies** (a local Python venv + `ffmpeg`) — you never
+run `pip` or `brew` yourself. The only thing it can't do for you is log in to
+Puras (that funds the AI renders): if you're not logged in, Claude tells you to
+run `puras login` once.
+
+<details>
+<summary>Manual / developer install (no plugin manager)</summary>
+
+Clone the repo and copy the skill into your Claude Code skills folder — Claude
+Code auto-discovers it (no restart; run `/skills` to confirm):
+
 ```bash
-pip install -r ~/.claude/skills/ugc-video-ads/requirements.txt   # puras, Pillow, httpx, opencv, …
-brew install ffmpeg                                              # ffmpeg + ffprobe on PATH
+git clone https://github.com/PurasAI/ugc-video-ads-workflow.git /tmp/uva
+cp -R /tmp/uva/plugins/ugc-video-ads/skills/ugc-video-ads ~/.claude/skills/ugc-video-ads
 ```
 
-**3. Connect your Puras account** — this funds the AI renders
-```bash
-puras login
-```
-
-**4. Restart Claude Code**, then run `/skills` to confirm `ugc-video-ads` is
-listed. That's it — now just ask Claude for an ad and it picks up the skill
-automatically.
+Dependencies still auto-install on first use — or prime them now with
+`bash ~/.claude/skills/ugc-video-ads/tools/setup.sh`.
+</details>
 
 ## Getting started
 
@@ -76,7 +77,7 @@ the skill. Some things to try:
 Claude organizes everything under `projects/<slug>/` (`assets/ generated/ work/
 out/`) and shows you the finished files in `out/`. For the full operating manual
 (skill catalog, input types, the trends playbook, conventions), see
-**[SKILL.md](SKILL.md)**.
+**[SKILL.md](plugins/ugc-video-ads/skills/ugc-video-ads/SKILL.md)**.
 
 ## FAQ
 
@@ -117,6 +118,7 @@ Yes — the modules are à-la-carte. *"Just add captions to this clip"* or *"jus
 give me a trend report"* both work without the rest of the pipeline.
 
 **What do I need installed?**
-Claude Code, Python 3 (with the `requirements.txt` packages), ffmpeg/ffprobe on
-PATH, and a Puras account (`puras login`). See [Install](#install-into-claude-code)
-above.
+Just [Claude Code](https://claude.com/claude-code) and a [Puras](https://puras.co)
+account. The skill installs its own Python deps and `ffmpeg` on first run (a local
+venv + Homebrew/apt) — you only run `puras login` once to fund renders. See
+[Install](#install) above.

@@ -21,15 +21,30 @@ generation muscle) with **local ffmpeg tools** (the finishing/editing muscle).
 order.** A user might only want a trend scan, or only to add an outro + logo to
 a clip they already have, or the whole pipeline. Don't force the full sequence.
 
-- **Skill root:** `/Users/mehmetecevit/work/purasroot/ugc-video-ads`  (tools in `tools/`)
-- **Run tools with:** `python3 <skill-root>/tools/<tool>.py …`
-- **Projects live in:** `<skill-root>/projects/<slug>/` with `assets/ generated/ work/ out/`
-  and a `project.json` inventory. Always work inside a project dir; create one
-  with `ingest.py` (or just `mkdir`). Pass absolute paths to every tool.
+- **Skill root:** `${CLAUDE_SKILL_DIR}` — the folder this `SKILL.md` lives in
+  (Claude Code sets this variable to the skill's install path); tools are in
+  `${CLAUDE_SKILL_DIR}/tools/`.
+- **Run tools with the skill's venv python** (Setup creates it):
+  `${CLAUDE_SKILL_DIR}/.venv/bin/python3 ${CLAUDE_SKILL_DIR}/tools/<tool>.py …`
+  The bash examples below write plain `python3 tools/…` for brevity — in practice
+  use the venv python and absolute `${CLAUDE_SKILL_DIR}` paths (cwd is the user's
+  project, not the skill).
+- **Projects live in:** `${CLAUDE_SKILL_DIR}/projects/<slug>/` with
+  `assets/ generated/ work/ out/` and a `project.json` inventory. Always work
+  inside a project dir; create one with `ingest.py` (or just `mkdir`). Pass
+  absolute paths to every tool.
 
-## Setup (once)
-`pip install puras Pillow httpx` · `brew install ffmpeg` · `puras login` (the
-user is already authenticated — workspace balance funds renders).
+## Setup — the skill installs its own dependencies
+Before the first tool run, bootstrap the environment (idempotent — a fast no-op
+once it's set up, so it's safe to run at the start of any session):
+```bash
+bash ${CLAUDE_SKILL_DIR}/tools/setup.sh
+```
+It creates a venv at `${CLAUDE_SKILL_DIR}/.venv`, installs the Python deps from
+`requirements.txt`, and installs `ffmpeg` (via Homebrew/apt) if missing — **the
+user never runs `pip` or `brew` by hand.** If it reports Puras is not logged in,
+ask the user to run `${CLAUDE_SKILL_DIR}/.venv/bin/puras login` once (this funds
+renders from the workspace balance).
 
 > **⚠ Cost.** Generation (the `generate` module) runs on **puras.co and spends
 > the workspace balance** per render (video models: Seedance/Kling, TTS,
@@ -226,4 +241,6 @@ Writes the files + `variants.json`. Cap is 24 (ratios × labels). Reframe is
 - This Homebrew ffmpeg lacks `drawtext` (no libfreetype) — that's why text is
   drawn via Pillow PNG overlays. Don't reintroduce drawtext.
 - Long renders: `puras_skill.py` polls up to `--timeout` (def 900s). If it times
-  out it prints the job id — resume watching with `puras logs <id>`.
+  out the job keeps running server-side and the tool prints its id — re-attach and
+  download (no resubmit, no extra cost) with
+  `puras_skill.py --resume <job_id> --download-dir projects/<slug>/generated`.

@@ -1,0 +1,11 @@
+{
+  "name": "ugc-video-ads",
+  "description": "Create short-form UGC video ads end-to-end with Puras hosted studios + local ffmpeg.",
+  "version": "0.1.0",
+  "author": {
+    "name": "PurasAI",
+    "url": "https://puras.co"
+  },
+  "homepage": "https://github.com/PurasAI/ugc-video-ads-workflow",
+  "keywords": ["ugc", "video", "ads", "ffmpeg", "puras", "tiktok", "reels", "marketing"]
+}

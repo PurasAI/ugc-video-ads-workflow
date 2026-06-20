@@ -112,10 +112,19 @@ def screen_matte(bgr, hue, smin, vmin):
 
 
 def order_quad(pts):
+    # Corners in a consistent CLOCKWISE cyclic order, started at the image-top-left-most vertex.
+    # A pure angular sort about the centroid is robust to ANY in-plane rotation, unlike the
+    # classic sum/diff corner assignment, which collapses two corners onto one role once the
+    # quad rolls past ~45deg (duplicate corners -> degenerate homography -> garbage track ->
+    # frame keyed black). PASS 1 then LOCKS corner identity across frames temporally, so a
+    # heavily tilted / rotating phone keeps a stable TL,TR,BR,BL labelling.
     pts = pts.reshape(4, 2).astype(np.float32)
-    s = pts.sum(1); d = pts[:, 0] - pts[:, 1]
-    return np.array([pts[np.argmin(s)], pts[np.argmax(d)],
-                     pts[np.argmax(s)], pts[np.argmin(d)]], np.float32)  # TL TR BR BL
+    c = pts.mean(0)
+    pts = pts[np.argsort(np.arctan2(pts[:, 1] - c[1], pts[:, 0] - c[0]))]            # cyclic order
+    area = float(sum(pts[k, 0] * pts[(k + 1) % 4, 1] - pts[(k + 1) % 4, 0] * pts[k, 1] for k in range(4)))
+    if area < 0:                                          # enforce CW winding (image coords, y down)
+        pts = pts[::-1]
+    return np.roll(pts, -int(np.argmin(pts.sum(1))), axis=0).astype(np.float32)      # start near TL
 
 
 def screen_quad_and_filled(mask):
@@ -341,6 +350,7 @@ def main():
 
     # ---- PASS 1: detect green + markers per frame ----
     grays, quads, marks, ok_s = [], [], [], []
+    prev_oq = None
     while True:
         ok, fr = cap.read()
         if not ok:
@@ -350,6 +360,15 @@ def main():
         if int(np.count_nonzero(m)) < 4000:
             quads.append(None); marks.append(np.zeros((0, 2), np.float32)); ok_s.append(False); continue
         q, filled = screen_quad_and_filled(m)
+        if q is not None and prev_oq is not None:
+            # LOCK corner identity frame-to-frame: pick the cyclic roll of this (consistently
+            # wound) quad that best matches the previous frame's corners. Tracks TL,TR,BR,BL
+            # smoothly through large rotation, where a purely per-frame geometric label jumps
+            # between physical corners and breaks the lattice match -> quad-fallback -> black.
+            k = min(range(4), key=lambda r: float(np.sum(np.linalg.norm(np.roll(q, -r, 0) - prev_oq, axis=1))))
+            q = np.roll(q, -k, 0)
+        if q is not None:
+            prev_oq = q
         quads.append(q); ok_s.append(q is not None)
         marks.append(detect_markers(g, filled, args.shape_validate, args.subpix)
                      if filled is not None else np.zeros((0, 2), np.float32))
@@ -392,7 +411,14 @@ def main():
     # grid dims from M + orientation (markers run 2 along the short side, 3 along the long)
     DIMS = {4: (2, 2), 6: (3, 2) if landscape else (2, 3), 8: (4, 2) if landscape else (2, 4),
             9: (3, 3)}
-    nx, ny = DIMS.get(M, (3, 2) if landscape else (2, 3))
+    # GENERATED footage routinely yields a spurious/merged blob or two (the notch, glare, a
+    # caption edge), so the MODAL detected count is often 1-2 above the true grid — e.g. a real
+    # 3x3=9 screen reads as a stable 10. Falling through to the wrong default (2x3) then forces a
+    # 3x3 lattice into a 2x3 model, breaking full-span on most frames -> quad-fallback -> black.
+    # Snap M to the NEAREST known grid size (ties -> larger) instead.
+    if M not in DIMS:
+        M = min(DIMS, key=lambda k: (abs(k - M), -k))
+    nx, ny = DIMS[M]
     G_IDEAL = np.array([[c, r] for r in range(ny) for c in range(nx)], np.float32)
 
     # Calibration prior bootstraps the lattice->image match. Two sources, and we keep

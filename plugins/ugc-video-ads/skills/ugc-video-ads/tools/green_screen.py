@@ -378,6 +378,32 @@ def main():
     if not any(ok_s):
         C.die("no green screen detected — widen --hue/--sat-min/--val-min, use --debug")
 
+    # ---- re-anchor ABSOLUTE orientation ----
+    # The temporal corner-lock keeps labels CONSISTENT across frames, but anchored to the first
+    # phone frame — which, if that frame was rotated (a mid-reveal tilt), leaves the whole clip's
+    # TL,TR,BR,BL rolled 90/180deg, so the inserted media renders sideways. Fix it once: on the
+    # most UPRIGHT, frontal frame the true top-left is the min(x+y) corner; roll EVERY quad by the
+    # same amount so corner 0 is that true TL. (Done before grid/landscape detection, which read
+    # the quad's width vs height and so also depend on a correct corner order.)
+    def _persp(q):
+        d1 = np.linalg.norm(q[0] - q[2]); d2 = np.linalg.norm(q[1] - q[3])
+        t = np.linalg.norm(q[1] - q[0]); b = np.linalg.norm(q[2] - q[3])
+        l = np.linalg.norm(q[3] - q[0]); r = np.linalg.norm(q[2] - q[1])
+        return abs(d1 - d2) / (d1 + d2 + 1e-6) + abs(t - b) / (t + b + 1e-6) + abs(l - r) / (l + r + 1e-6)
+    def _axis(q):       # mean edge deviation from horizontal/vertical (0 = perfectly upright)
+        a = []
+        for k in range(4):
+            e = q[(k + 1) % 4] - q[k]; ang = abs(np.degrees(np.arctan2(e[1], e[0]))) % 90
+            a.append(min(ang, 90 - ang))
+        return float(np.mean(a))
+    _gf = [i for i in range(N) if ok_s[i] and quads[i] is not None]
+    if _gf:
+        _ref = min(_gf, key=lambda i: _persp(quads[i]) + _axis(quads[i]) / 30.0)
+        _k0 = int(np.argmin(quads[_ref].sum(1)))
+        if _k0:
+            for i in _gf:
+                quads[i] = np.roll(quads[i], -_k0, axis=0)
+
     # ---- auto-detect the marker grid (nx x ny), any orientation / inset / count ----
     cand = [i for i in range(N) if ok_s[i] and quads[i] is not None and len(marks[i]) >= 4]
     if not cand:

@@ -58,23 +58,6 @@ def green_mask(bgr, hue=(35, 90), smin=40, vmin=40):
     return cv2.inRange(hsv, (hue[0], smin, vmin), (hue[1], 255, 255))
 
 
-def key_green_mask(bgr, hue, smin, vmin):
-    """Inclusive green key for COMPOSITING (wider than the tracking mask so dark/
-    desaturated screen-green at the edges is still caught and keyed out)."""
-    ycc = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
-    ycc[:, :, 1] = cv2.medianBlur(ycc[:, :, 1], 3)
-    ycc[:, :, 2] = cv2.medianBlur(ycc[:, :, 2], 3)
-    den = cv2.cvtColor(ycc, cv2.COLOR_YCrCb2BGR)
-    hsv = cv2.cvtColor(den, cv2.COLOR_BGR2HSV)
-    m = cv2.inRange(hsv, (max(0, hue[0] - 3), max(0, smin - 15), max(0, vmin - 15)),
-                    (min(179, hue[1] + 5), 255, 255))
-    lab = cv2.cvtColor(den, cv2.COLOR_BGR2LAB)
-    b, g, r = cv2.split(den.astype(np.int16))
-    greenish = ((g - np.maximum(r, b)) > 12).astype(np.uint8) * 255
-    la = cv2.inRange(lab[:, :, 1], 0, 125)     # LAB a* low = green, robust to brightness
-    return cv2.bitwise_or(m, cv2.bitwise_and(la, greenish))
-
-
 def fill_small_holes(mask, max_area):
     """Fill interior holes smaller than max_area (marker crosses, speckle) while
     KEEPING large interior holes (fingers crossing the screen) open for occlusion."""
@@ -88,11 +71,6 @@ def fill_small_holes(mask, max_area):
     return out
 
 
-def greenness(bgr):
-    b, g, r = cv2.split(bgr.astype(np.int16))
-    return (g - np.maximum(r, b)).astype(np.float32)   # large+ on pure green
-
-
 def screen_matte(bgr, hue, smin, vmin):
     """COLOR-DIFFERENCE key (the core of Keylight): the key signal is
     d = G - max(R, B) — large on green, ~0 on the neutral/dark bezel — and the alpha is a
@@ -102,7 +80,7 @@ def screen_matte(bgr, hue, smin, vmin):
     filled to solid; large foreground occluders (fingers) stay transparent for occlusion.
     A garbage matte (the largest green blob) ignores stray scene green."""
     b, g, r = cv2.split(bgr.astype(np.float32))
-    d = g - np.maximum(r, b)
+    d = g - np.maximum(r, b)                              # color difference (greenness)
     H, W = bgr.shape[:2]
     n, lab, stats, _ = cv2.connectedComponentsWithStats((d > 20).astype(np.uint8), 8)
     if n <= 1:
@@ -113,8 +91,11 @@ def screen_matte(bgr, hue, smin, vmin):
     screen = (lab == idx).astype(np.uint8) * 255
     area = float(stats[idx, cv2.CC_STAT_AREA])
     inner = cv2.erode(screen, np.ones((11, 11), np.uint8)) > 0
+    # Clip-Black / Clip-White as a fraction of the solid-green level: the band [cb,cw] sits
+    # in the green->bezel transition (NOT inside the green distribution, which would map the
+    # green's own noise to a speckled alpha). hi = solid-green key level.
     hi = float(np.percentile(d[inner], 50)) if int(np.count_nonzero(inner)) > 50 else float(d.max())
-    cb, cw = 0.10 * hi, 0.55 * hi               # clip-black / clip-white
+    cb, cw = 0.10 * hi, 0.55 * hi
     alpha = np.clip((d - cb) / max(1.0, cw - cb), 0.0, 1.0)
     alpha[~(cv2.dilate(screen, np.ones((7, 7), np.uint8)) > 0)] = 0.0     # garbage matte
     # fill interior dark marks (markers + notch) incl. their anti-aliased halo: small enclosed
@@ -123,6 +104,10 @@ def screen_matte(bgr, hue, smin, vmin):
     filled = fill_small_holes(solid, max_area=max(3000.0, 0.06 * area))
     fillmask = cv2.dilate(((filled > 0) & (solid == 0)).astype(np.uint8), np.ones((3, 3), np.uint8))
     alpha[fillmask > 0] = 1.0
+    # sub-pixel CHOKE: raise the ramp floor to bury the outermost green-contaminated ring,
+    # sub-pixel and soft (a morphological erode would move the edge by whole px and re-ragged it).
+    cval = 0.08
+    alpha = np.clip((alpha - cval) / (1.0 - cval), 0.0, 1.0)
     return np.clip(cv2.GaussianBlur(alpha, (0, 0), 0.6), 0.0, 1.0)
 
 
@@ -187,11 +172,27 @@ def detect_markers(gray, filled, shape_validate=True, subpix="cornersubpix"):
     if not pts:
         return np.zeros((0, 2), np.float32)
     pts = np.array(pts, np.float32)
-    if subpix == "cornersubpix":
-        p = pts.reshape(-1, 1, 2).copy()
-        cv2.cornerSubPix(gray, p, (5, 5), (-1, -1),
-                         (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
-        pts = p.reshape(-1, 2)
+    if subpix != "none":
+        # Lock onto the "+" CENTRE, not an arm corner. cornerSubPix latches onto one of the
+        # plus's ~12 corners (which flips frame-to-frame -> the marker jumps side to side).
+        # Instead use a black-hat-weighted centroid in a window: the cross is symmetric, so its
+        # intensity-weighted centre of mass IS the centre, regardless of rotation, and it uses
+        # ALL the cross pixels (not one corner) -> stable, sub-pixel.
+        H0, W0 = gray.shape; win = max(5, int(round(0.5 * 0.13 * min(sw, sh)))) | 1
+        gx, gy = np.meshgrid(np.arange(-win, win + 1), np.arange(-win, win + 1))
+        out = pts.copy()
+        for j in range(len(pts)):
+            for _ in range(2):                       # 2 mean-shift iterations to the centre
+                xi, yi = int(round(out[j, 0])), int(round(out[j, 1]))
+                if xi - win < 0 or yi - win < 0 or xi + win >= W0 or yi + win >= H0:
+                    break
+                wpatch = bh[yi - win:yi + win + 1, xi - win:xi + win + 1].astype(np.float32)
+                wpatch = np.maximum(wpatch - 0.25 * wpatch.max(), 0.0)   # keep only the dark cross
+                s = wpatch.sum()
+                if s < 1:
+                    break
+                out[j] = [xi + (gx * wpatch).sum() / s, yi + (gy * wpatch).sum() / s]
+        pts = out
     return pts.reshape(-1, 2)
 
 
@@ -282,26 +283,26 @@ def cover_crop(src, aspect):
     nh = int(round(w / aspect)); y0 = (h - nh) // 2; return src[y0:y0 + nh, :]
 
 
-def despill(bgr, region, bias=0.5):
-    out = bgr.astype(np.float32); b, gch, r = out[:, :, 0], out[:, :, 1], out[:, :, 2]
-    ref = bias * r + (1 - bias) * b; sel = region.astype(bool)
-    gch[sel] = np.minimum(gch, ref)[sel]; return out.astype(np.uint8)
-
-
 # ============================ main ============================
 def main():
     ap = argparse.ArgumentParser(description="Marker-tracked green-screen replacement.")
     ap.add_argument("--video", required=True, help="base clip with a green device screen")
     ap.add_argument("--image", help="replacement still image")
     ap.add_argument("--screen", help="replacement video (looped) — alternative to --image")
+    ap.add_argument("--screen-volume", type=float, default=0.2,
+                    help="volume of the --screen video's own audio mixed under the original "
+                         "(0 = mute; default 0.2). Original clip audio stays at full volume.")
     ap.add_argument("--out", required=True)
     ap.add_argument("--hue", default="35,90", help="green hue lo,hi (OpenCV 0-179)")
     ap.add_argument("--sat-min", type=int, default=40)
     ap.add_argument("--val-min", type=int, default=40)
-    ap.add_argument("--pos-window", type=int, default=5, help="zero-phase smoothing window: position")
-    ap.add_argument("--rot-window", type=int, default=9, help="smoothing window: rotation")
-    ap.add_argument("--scale-window", type=int, default=11, help="smoothing window: uniform scale")
-    ap.add_argument("--persp-window", type=int, default=7, help="smoothing window: perspective residual")
+    # zero-phase (offline, symmetric) smoothing -> no lag. Scale/rotation/keystone are
+    # near-constant for a handheld phone, so high-freq variation there is detector noise:
+    # smooth them HARD. Position tracks the hand, so keep it lighter.
+    ap.add_argument("--pos-window", type=int, default=9, help="zero-phase smoothing window: position")
+    ap.add_argument("--rot-window", type=int, default=31, help="smoothing window: rotation (smooth hard)")
+    ap.add_argument("--scale-window", type=int, default=41, help="smoothing window: uniform scale (smooth hard)")
+    ap.add_argument("--persp-window", type=int, default=25, help="smoothing window: perspective/keystone (smooth hard)")
     ap.add_argument("--overfill", type=float, default=1.04, help="warp the insert onto a quad this much "
                     "bigger so it always covers the green; the key clips it back")
     ap.add_argument("--feather", type=float, default=0.6, help="extra key-edge feather sigma "
@@ -314,8 +315,8 @@ def main():
                     help="frames to crossfade insert<->black at confidence boundaries")
     ap.add_argument("--no-shape-validate", dest="shape_validate", action="store_false",
                     help="keep all dark blobs as markers (don't reject by cross shape)")
-    ap.add_argument("--subpix", choices=["cornersubpix", "none"], default="cornersubpix",
-                    help="marker sub-pixel refinement method")
+    ap.add_argument("--subpix", choices=["center", "none"], default="center",
+                    help="sub-pixel marker centre refinement (black-hat-weighted centroid)")
     ap.add_argument("--debug", help="optional overlay diagnostic clip (tracked quad + markers)")
     ap.set_defaults(shape_validate=True)
     args = ap.parse_args()
@@ -487,8 +488,14 @@ def main():
                         msrc, mdst = s0[keep], d0[keep]
                         cset = {int(round(c)) for c in msrc[:, 0]}; rset = {int(round(r)) for r in msrc[:, 1]}
                         full_span = (0 in cset and nx - 1 in cset and 0 in rset and ny - 1 in rset)
-        Hcur = None
+        # do the matched markers SPAN the screen? a sparse/clustered grid (e.g. 4 markers
+        # bunched in the centre) must NOT define the extent on its own — extrapolating the
+        # screen rect from a small cluster amplifies sub-pixel noise into huge jitter.
+        span_ok = False
         if msrc is not None and full_span:
+            span_ok = float(np.linalg.norm(mdst.max(0) - mdst.min(0))) > 0.55 * diag
+        Hcur = None
+        if msrc is not None and full_span and span_ok:
             Hf, _ = cv2.findHomography(msrc, mdst, 0)
             if Hf is not None and Hq is not None:
                 cn = cv2.perspectiveTransform(rect_g.reshape(-1, 1, 2), Hf).reshape(4, 2)
@@ -497,12 +504,15 @@ def main():
             if Hf is not None:
                 Hcur = Hf; source[i] = "marker"; good[i] = True
         if Hcur is None and msrc is not None and Hq is not None:
-            Hf, _ = cv2.findHomography(np.vstack([np.repeat(msrc, MK_W, 0), rect_g]),
-                                       np.vstack([np.repeat(mdst, MK_W, 0), quads[i]]), 0)
+            # fuse: the quad pins the extent (no extrapolation), markers refine the interior.
+            # markers weighted less when clustered (they're a noisy local patch then).
+            mw = MK_W if span_ok else 1
+            Hf, _ = cv2.findHomography(np.vstack([np.repeat(msrc, mw, 0), rect_g]),
+                                       np.vstack([np.repeat(mdst, mw, 0), quads[i]]), 0)
             if Hf is not None:
                 cn = cv2.perspectiveTransform(rect_g.reshape(-1, 1, 2), Hf).reshape(4, 2)
                 if np.max(np.linalg.norm(cn - quads[i], axis=1)) < 0.30 * diag:
-                    Hcur = Hf; source[i] = "partial"
+                    Hcur = Hf; source[i] = "marker"; good[i] = True   # confident quad+marker fusion
                 else:
                     Hcur = Hq; source[i] = "quad"
             else:
@@ -533,6 +543,9 @@ def main():
     # ---- stabilise ----
     corners_s = stabilise(corners, good, aspect,
                           args.pos_window, args.rot_window, args.scale_window, args.persp_window)
+    if os.environ.get("DUMP_CORNERS"):
+        np.savez(args.out + ".corners.npz", corners=corners, corners_s=corners_s,
+                 good=good, source=np.array(source), nx=nx, ny=ny)
 
     # ---- low-confidence -> black (time-eased confidence weight) ----
     def gauss(x, sigma):
@@ -588,22 +601,27 @@ def main():
         a = screen_matte(frame, hue, args.sat_min, args.val_min)   # continuous, anti-aliased
         if args.feather > 0:
             a = np.clip(cv2.GaussianBlur(a, (0, 0), args.feather), 0, 1)
-        gm = (a > 0.5).astype(np.uint8) * 255                       # binary, for despill region
-        alpha = a[:, :, None]
-        region = cv2.dilate(gm, np.ones((5, 5), np.uint8))
-        plate = despill(frame, region, args.despill_bias)
+        gm = (a > 0.5).astype(np.uint8) * 255
+        # DESPILL the PLATE (not the output): matte-controlled, strongest on the soft edge,
+        # with luminance restore -> kills the green fringe without desaturating the inserted UI.
+        fp = frame.astype(np.float32); pb, pg, pr = fp[:, :, 0], fp[:, :, 1], fp[:, :, 2]
+        ref = args.despill_bias * pr + (1 - args.despill_bias) * pb
+        edge_w = 4.0 * a * (1.0 - a)                                 # peaks on the soft edge band
+        gnew = pg - edge_w * np.maximum(0.0, pg - ref)
+        loss = pg - gnew
+        region = (cv2.dilate(gm, np.ones((5, 5), np.uint8)) > 0)[:, :, None]
+        plate = np.where(region, np.stack([pb + 0.5 * loss, gnew, pr + 0.5 * loss], -1), fp)
         content = card.astype(np.float32) * float(w[fi])     # fade to black where low-confidence
-        out = content * alpha + plate.astype(np.float32) * (1 - alpha)
-        sel = cv2.dilate(gm, np.ones((7, 7), np.uint8)).astype(bool)
-        out[:, :, 1][sel] = np.minimum(out[:, :, 1], (out[:, :, 2] + out[:, :, 0]) / 2)[sel]
+        alpha = a[:, :, None]
+        out = content * alpha + plate * (1 - alpha)
         vw.write(np.clip(out, 0, 255).astype(np.uint8))
         if dbg is not None:
             d = frame.copy()
-            col = {"marker": (0, 255, 0), "partial": (0, 255, 255), "quad": (0, 165, 255),
-                   "hold": (0, 0, 255), "none": (128, 128, 128)}[source[fi]]
-            cv2.polylines(d, [S.astype(np.int32)], True, col, 2)
+            col = {"marker": (255, 0, 255), "partial": (0, 255, 255), "quad": (0, 165, 255),
+                   "hold": (0, 0, 255), "none": (128, 128, 128)}[source[fi]]   # magenta=marker (visible on green)
+            cv2.polylines(d, [S.astype(np.int32)], True, col, 3)
             for p in marks[fi]:
-                cv2.circle(d, (int(p[0]), int(p[1])), 6, (255, 0, 0), 1)
+                cv2.drawMarker(d, (int(p[0]), int(p[1])), (255, 0, 0), cv2.MARKER_CROSS, 18, 2)
             cv2.putText(d, f"f{fi} {source[fi]}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
             dbg.write(d)
         fi += 1
@@ -612,8 +630,21 @@ def main():
         dbg.release()
 
     C.ensure_parent(args.out)
-    C.run(["ffmpeg", "-y", "-i", tmp, "-i", args.video, "-map", "0:v", "-map", "1:a?",
-           "-shortest", *C.V_CODEC, *C.A_CODEC, args.out])
+    # audio: original clip at full volume; if the inserted --screen video has audio, mix it
+    # in at --screen-volume (default low, so it sits under the creator's voice).
+    v_audio = C.probe(args.video).has_audio
+    s_audio = bool(args.screen) and args.screen_volume > 0 and C.probe(args.screen).has_audio
+    if v_audio and s_audio:
+        C.run(["ffmpeg", "-y", "-i", tmp, "-i", args.video, "-i", args.screen, "-filter_complex",
+               f"[2:a]volume={args.screen_volume}[sa];[1:a][sa]amix=inputs=2:duration=first:normalize=0[aout]",
+               "-map", "0:v", "-map", "[aout]", "-shortest", *C.V_CODEC, *C.A_CODEC, args.out])
+    elif s_audio:                                     # original has no audio -> just the screen audio
+        C.run(["ffmpeg", "-y", "-i", tmp, "-i", args.screen, "-filter_complex",
+               f"[1:a]volume={args.screen_volume}[aout]", "-map", "0:v", "-map", "[aout]",
+               "-shortest", *C.V_CODEC, *C.A_CODEC, args.out])
+    else:
+        C.run(["ffmpeg", "-y", "-i", tmp, "-i", args.video, "-map", "0:v", "-map", "1:a?",
+               "-shortest", *C.V_CODEC, *C.A_CODEC, args.out])
     os.unlink(tmp)
     if dbg is not None:
         C.run(["ffmpeg", "-y", "-i", args.debug + ".tmp.mp4", *C.V_CODEC, args.debug])

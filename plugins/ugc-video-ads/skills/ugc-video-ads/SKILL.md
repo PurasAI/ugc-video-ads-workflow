@@ -227,10 +227,13 @@ screen-grounding/first-frame reference; confirm the field on the skill's page.)
 ```bash
 # still UI image:
 python3 tools/green_screen.py --video generated/clip.mp4 --image app-ui.png --out out/final.mp4
-# or a looping video, + a tracking-overlay diagnostic:
+# or a looping VIDEO inside the screen, + a tracking-overlay diagnostic:
 python3 tools/green_screen.py --video generated/clip.mp4 --screen app-demo.mp4 \
     --out out/final.mp4 --debug debug.mp4
 ```
+The insert is either a still (`--image`) or a video (`--screen`, looped to the clip length).
+If the `--screen` video has its **own audio**, it's mixed under the original clip's audio at
+`--screen-volume` (default **0.2**; `0` mutes it). The original clip's audio stays at full volume.
 
 ### ⚠ For the track to lock — keep these in the brief / when shooting
 The bundled tracker image already satisfies "green + markers"; the rest is framing:

@@ -144,7 +144,7 @@ images small; repeat the flag for array fields like `product_images`).
   `duration_seconds` (4–15, def 8), `music` (**string** mood/genre, optional —
   omit to auto-pick), `captions` (**boolean**, def true — burns karaoke captions
   in-skill). → `videos[].video_url`. **Planning a screen replacement?** Ground the
-  phone screen with the bundled tracker image (`assets/tracker-green-3x3.png`) — see
+  phone screen with the bundled tracker image (`assets/tracker-green-3x3.jpg`) — see
   the **screen-replace** module, Step 1.
 - `motion-ad-video` — storyboarded motion ad. `product-reveal-video` — cinematic
   reveal. `social-photo` / `static-image-ad` — product stills/image ads.
@@ -209,13 +209,13 @@ CV (no ML); rock-solid, jitter-free.
 
 ### Step 1 — generate the clip with the bundled tracker screen
 The skill ships a ready tracker image tuned for this tool:
-**`${CLAUDE_SKILL_DIR}/assets/tracker-green-3x3.png`** — a vivid chroma-green screen with
+**`${CLAUDE_SKILL_DIR}/assets/tracker-green-3x3.jpg`** — a vivid chroma-green screen with
 a **3×3 grid of black "+" markers** (auto-detected, reaches the corners, sub-pixel). When
 generating, hand it to `ugc-video` as the **phone-screen reference** and describe it in
 the brief, so the rendered phone holds exactly that screen:
 ```bash
 python3 tools/puras_skill.py --brief projects/<slug>/briefs/<name>.md \
-    --image first_frame=${CLAUDE_SKILL_DIR}/assets/tracker-green-3x3.png \
+    --image first_frame=${CLAUDE_SKILL_DIR}/assets/tracker-green-3x3.jpg \
     --download-dir projects/<slug>/generated
 ```
 In the brief body, say the creator **holds a phone whose screen is a solid green screen
